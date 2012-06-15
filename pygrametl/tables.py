@@ -125,27 +125,27 @@ class Dimension(object):
 
         # This gives "SELECT key FROM name WHERE lookupval1 = %(lookupval1)s
         #             AND lookupval2 = %(lookupval2)s AND ..."
-        self.keylookupsql = "SELECT " + key + " FROM " + name + " WHERE " + \
+        self.keylookupsql = "SELECT " + self.key + " FROM " + self.name + " WHERE " + \
             " AND ".join(["%s = %%(%s)s" % (lv, lv) for lv in self.lookupatts])
 
         # This gives "SELECT key, att1, att2, ... FROM NAME WHERE key = %(key)s"
         self.rowlookupsql = "SELECT " + ", ".join(self.all) +  \
-            " FROM %s WHERE %s = %%(%s)s" % (name, key, key)
+            " FROM %s WHERE %s = %%(%s)s" % (self.name, self.key, self.key)
 
         # This gives "INSERT INTO name(key, att1, att2, ...)
         #             VALUES (%(key)s, %(att1)s, %(att2)s, ...)"
-        self.insertsql = "INSERT INTO " + name + "(%s" % (key,) + \
-            (attributes and ", " or "") + \
-            ", ".join(attributes) + ") VALUES (" + \
+        self.insertsql = "INSERT INTO " + self.name + "(%s" % (self.key,) + \
+            (self.attributes and ", " or "") + \
+            ", ".join(self.attributes) + ") VALUES (" + \
             ", ".join(["%%(%s)s" % (att,) for att in self.all]) + ")"
 
 
     def _get_idfinder(self):
 
-        self.targetconnection.execute("SELECT MAX(%s) FROM %s" % \
+        result = self.targetconnection.execute("SELECT MAX(%s) FROM %s" % \
                                           (self.key, self.name))
-        #self._maxid = self.targetconnection.fetchonetuple()[0]
-        self._maxid = self.targetconnection.fetchone()[0]
+        #self._maxid = result.fetchonetuple()[0]
+        self._maxid = result.fetchone()[0]
         if self._maxid is None:
             self._maxid = 0
         return self._getnextid
@@ -166,13 +166,13 @@ class Dimension(object):
 
         if namemapping and row:
             row = pygrametl.copy(row, **namemapping)
-            sql = self.keylookupsql % row
-        #self.targetconnection.execute(self.keylookupsql, row)
-        self.targetconnection.execute(sql)
+        sql = self.keylookupsql % row
+        #result = self.targetconnection.execute(self.keylookupsql, row)
+        result = self.targetconnection.execute(sql)
         #, namemapping)
 
-        #keyvalue = self.targetconnection.fetchonetuple()[0]
-        keyvalue = self.targetconnection.fetchone()[0]
+        #keyvalue = result.fetchonetuple()[0]
+        keyvalue = result.fetchone()[0]
         if keyvalue is None:
             keyvalue = self.defaultidvalue  # most likely also None...
 
@@ -1378,8 +1378,8 @@ class FactTable(object):
         # INSERT INTO name (key1, ..., keyn, meas1, ..., measn)
         # VALUES (%(key1)s, ..., %(keyn)s, %(meas1)s, ..., %(measn)s)
         self.insertsql = "INSERT INTO " + self.name + "(" + \
-            ", ".join(keyrefs) + (measures and ", " or "") + \
-            ", ".join(measures) + ") VALUES (" + \
+            ", ".join(self.keyrefs) + (self.measures and ", " or "") + \
+            ", ".join(self.measures) + ") VALUES (" + \
             ", ".join(["%%(%s)s" % (att,) for att in self.all]) + ")"
 
         # SELECT key1, ..., keyn, meas1, ..., measn FROM name
