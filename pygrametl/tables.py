@@ -54,16 +54,23 @@ from pygrametl.FIFODict import FIFODict
 __author__ = "Christian Thomsen"
 __maintainer__ = "Christian Thomsen"
 __version__ = '0.2.0.3'
-__all__ = ['Dimension', 'CachedDimension', 'SlowlyChangingDimension',
+__all__ = ['Dimension', 'SlowlyChangingDimension',
            'SnowflakedDimension', 'FactTable', 'BatchFactTable',
            'BulkFactTable', 'SubprocessFactTable']
 
 class Dimension(object):
-    """A class for accessing a dimension. Does no caching."""
+    """A class for accessing a dimension. Does optional caching.
+
+    When caching, we assume that the DB doesn't change or add any
+    attribute values that are cached. For example, a DEFAULT value in
+    the DB can break this assumption.
+    """
 
     def __init__(self, name, key, attributes, lookupatts=(),
                  idfinder=None, defaultidvalue=None, rowexpander=None,
-                targetconnection=None):
+                 targetconnection=None, caching=True,
+                 size=10000, prefill=False, cachefullrows=False,
+                 cacheoninsert=True):
         """Arguments:
            - name: the name of the dimension table in the DW
            - key: the name of the primary key in the DW
@@ -92,6 +99,16 @@ class Dimension(object):
              done.
            - targetconnection: The ConnectionWrapper to use. If not given,
              the default target connection is used.
+           - caching: Whether to use caching. Default: True
+           - size: the maximum number of rows to cache. If less than or equal
+             to 0, unlimited caching is used. Default: 10000
+           - prefill: a flag deciding if the cache should be filled when
+             initialized. Default: False
+           - cachefullrows: a flag deciding if full rows should be
+             cached. If not, the cache only holds a mapping from
+             lookupattributes to key values. Default: False.
+           - cacheoninsert: a flag deciding if the cache should be updated
+             when insertions are done. Default: True
         """
         if not type(key) in types.StringTypes:
             raise ValueError, "Key argument must be a string"
@@ -119,6 +136,50 @@ class Dimension(object):
             self.idfinder = idfinder
         else:
             self.idfinder = self._get_idfinder()
+
+        ## Caching
+        self.caching = caching
+        if caching:
+            self.cacheoninsert = cacheoninsert
+            self.__prefill = prefill
+            self.__size = size
+            if size > 0:
+                if cachefullrows:
+                    self.__key2row = FIFODict(size)
+                self.__vals2key = FIFODict(size)
+            else:
+                # Use dictionaries as unlimited caches
+                if cachefullrows:
+                    self.__key2row = {}
+                self.__vals2key = {}
+
+            self.cachefullrows = cachefullrows
+
+            if prefill:
+                if cachefullrows:
+                    positions = tuple([self.all.index(att) \
+                                           for att in self.lookupatts])
+                    # select the key and all attributes
+                    sql = "SELECT %s FROM %s" % (", ".join(self.all), name)
+                else:
+                    # select the key and the lookup attributes
+                    sql = "SELECT %s FROM %s" % \
+                        (", ".join([key] + [l for l in self.lookupatts]), name)
+                    positions = range(1, len(self.lookupatts) + 1)
+
+                result = self.targetconnection.execute(sql)
+                if size <= 0:
+                    #data = self.targetconnection.fetchalltuples()
+                    data = result.fetchall()
+                else:
+                    #data = self.targetconnection.fetchmanytuples(size)
+                    data = result.fetchmany(size)
+
+                for rawrow in data:
+                    if cachefullrows:
+                        self.__key2row[rawrow[0]] = rawrow
+                    t = tuple([rawrow[i] for i in positions])
+                    self.__vals2key[t] = rawrow[0]
 
     def _init_sql(self):
         # Now create the SQL that we will need...
@@ -159,6 +220,18 @@ class Dimension(object):
             - row: a dict which must contain at least the lookup attributes
             - namemapping: an optional namemapping (see module's documentation)
         """
+        if self.caching:
+            res = self._before_lookup(row, namemapping)
+            if res is not None:
+                return res
+            if self.__prefill and self.cacheoninsert and \
+                    (self.__size <= 0 or len(self.__vals2key) < self.__size):
+                # Everything is cached. We don't have to look in the DB
+                return self.defaultidvalue
+        # Something is not cached so we have to use the classical lookup
+        return self.non_cached_lookup(row, namemapping)
+
+    def non_cached_lookup(self, row, namemapping=None):
         namemapping = namemapping or {}
         key = self._before_lookup(row, namemapping)
         if key is not None:
@@ -181,10 +254,17 @@ class Dimension(object):
 
 
     def _before_lookup(self, row, namemapping):
-        return None
+        if self.caching:
+            namesinrow = [(namemapping.get(a) or a) if namemapping else a
+                          for a in self.lookupatts]
+            searchtuple = tuple([row[n] for n in namesinrow])
+            return self.__vals2key.get(searchtuple, None)
 
     def _after_lookup(self, row, namemapping, resultkeyvalue):
-        pass
+        if self.caching and resultkeyvalue is not None:
+            namesinrow = [(namemapping.get(a) or a) for a in self.lookupatts]
+            searchtuple = tuple([row[n] for n in namesinrow])
+            self.__vals2key[searchtuple] = resultkeyvalue
 
     def getbykey(self, keyvalue):
         """Lookup and return the row with the given key value.
@@ -204,10 +284,17 @@ class Dimension(object):
         return row
 
     def _before_getbykey(self, keyvalue):
+        if self.caching and self.cachefullrows:
+            res = self.__key2row.get(keyvalue)
+            if res is not None:
+                return dict(zip(self.all, res))
         return None
 
     def _after_getbykey(self, keyvalue, resultrow):
-        pass
+        if self.caching and self.cachefullrows \
+                and resultrow[self.key] is not None:
+            # if resultrow[self.key] is None, no result was found in the db
+            self.__key2row[keyvalue] = tuple([resultrow[a] for a in self.all])
 
     def getbyvals(self, values, namemapping={}):
         """Return a list of all rows with values identical to the given.
@@ -273,7 +360,30 @@ class Dimension(object):
         self._after_update(row, namemapping)
 
     def _before_update(self, row, namemapping):
-        return None
+        if self.caching:
+            # We have to remove old values from the caches.
+            key = (namemapping.get(self.key) or self.key)
+            for att in self.lookupatts:
+                if ((att in namemapping and namemapping[att] in row)
+                    or att in row):
+                    # A lookup attribute is about to be changed and we should
+                    # make sure that the cache does not map from the old value.
+                    # Here, we can only see the new value, but we can get the
+                    # old lookup values by means of the key:
+                    oldrow = self.getbykey(row[key])
+                    namesinrow = [(namemapping.get(a) or a)
+                                  for a in self.lookupatts]
+                    searchtuple = tuple([oldrow[n] for n in namesinrow])
+                    if searchtuple in self.__vals2key:
+                        del self.__vals2key[searchtuple]
+                    break
+
+
+            if self.cachefullrows:
+                if row[key] in self.__key2row:
+                    # The cached row is now incorrect. We must make sure it is
+                    # not in the cache.
+                    del self.__key2row[row[key]]
 
     def _after_update(self, row, namemapping):
         pass
@@ -332,7 +442,17 @@ class Dimension(object):
         return None
 
     def _after_insert(self, row, namemapping, newkeyvalue):
-        pass
+        # After the insert, we can look the row up. Pretend that we
+        # did that. Then we get the new data cached.
+        # NB: Here we assume that the DB doesn't change or add anything.
+        # For example, a DEFAULT value in the DB breaks this assumption.
+        if self.caching and self.cacheoninsert:
+            self._after_lookup(row, namemapping, newkeyvalue)
+            # import pdb; pdb.set_trace()
+            if self.cachefullrows:
+                tmp = pygrametl.project(self.attributes, row, namemapping)
+                tmp[self.key] = newkeyvalue
+                self._after_getbykey(newkeyvalue, tmp)
 
 
 
@@ -381,7 +501,7 @@ WHERE """
         return self._getnextid
 
 
-    def lookup(self, row, namemapping=None):
+    def non_cached_lookup(self, row, namemapping=None):
         namemapping = namemapping or {}
         mapping = pygrametl.copy(row, **namemapping)
         select = sa.select([self.sa_table.c[self.key]],
@@ -403,182 +523,6 @@ WHERE """
         print "VAL", values
         ins = self.sa_table.insert().values(**values)
         self.targetconnection.execute(ins)
-
-
-
-class CachedDimension(Dimension):
-    """A class for accessing a dimension. Does caching.
-
-       We assume that the DB doesn't change or add any attribute
-       values that are cached.
-       For example, a DEFAULT value in the DB can break this assumption.
-    """
-
-    def __init__(self, name, key, attributes, lookupatts=(),
-                 idfinder=None, defaultidvalue=None, rowexpander=None,
-                 size=10000, prefill=False, cachefullrows=False,
-                 cacheoninsert=True, targetconnection=None):
-        """Arguments:
-           - name: the name of the dimension table in the DW
-           - key: the name of the primary key in the DW
-           - attributes: a sequence of the attribute names in the dimension
-             table. Should not include the name of the primary key which is
-             given in the key argument.
-           - lookupatts: A subset of the attributes that uniquely identify
-             a dimension members. These attributes are thus used for looking
-             up members. If not given, it is assumed that
-             lookupatts = attributes
-           - idfinder: A function(row, namemapping) -> key value that assigns
-             a value to the primary key attribute based on the content of the
-             row and namemapping. If not given, it is assumed that the primary
-             key is an integer, and the assigned key value is then the current
-             maximum plus one.
-           - defaultidvalue: An optional value to return when a lookup fails.
-             This should thus be the ID for a preloaded "Unknown" member.
-           - rowexpander: A function(row, namemapping) -> row. This function
-             is called by ensure before insertion if a lookup of the row fails.
-             This is practical if expensive calculations only have to be done
-             for rows that are not already present. For example, for a date
-             dimension where the full date is used for looking up rows, a
-             rowexpander can be set such that week day, week number, season,
-             year, etc. are only calculated for dates that are not already
-             represented. If not given, no automatic expansion of rows is
-             done.
-           - size: the maximum number of rows to cache. If less than or equal
-             to 0, unlimited caching is used. Default: 10000
-           - prefill: a flag deciding if the cache should be filled when
-             initialized. Default: False
-           - cachefullrows: a flag deciding if full rows should be
-             cached. If not, the cache only holds a mapping from
-             lookupattributes to key values. Default: False.
-           - cacheoninsert: a flag deciding if the cache should be updated
-             when insertions are done. Default: True
-           - targetconnection: The ConnectionWrapper to use. If not given,
-             the default target connection is used.
-        """
-
-        Dimension.__init__(self, name, key, attributes, lookupatts, idfinder,
-                           defaultidvalue, rowexpander, targetconnection)
-        self.cacheoninsert = cacheoninsert
-        self.__prefill = prefill
-        self.__size = size
-        if size > 0:
-            if cachefullrows:
-                self.__key2row = FIFODict(size)
-            self.__vals2key = FIFODict(size)
-        else:
-            # Use dictionaries as unlimited caches
-            if cachefullrows:
-                self.__key2row = {}
-            self.__vals2key = {}
-
-        self.cachefullrows = cachefullrows
-
-        if prefill:
-            if cachefullrows:
-                positions = tuple([self.all.index(att) \
-                                       for att in self.lookupatts])
-                # select the key and all attributes
-                sql = "SELECT %s FROM %s" % (", ".join(self.all), name)
-            else:
-                # select the key and the lookup attributes
-                sql = "SELECT %s FROM %s" % \
-                    (", ".join([key] + [l for l in self.lookupatts]), name)
-                positions = range(1, len(self.lookupatts) + 1)
-
-            self.targetconnection.execute(sql)
-            if size <= 0:
-                #data = self.targetconnection.fetchalltuples()
-                data = self.targetconnection.fetchall()
-            else:
-                #data = self.targetconnection.fetchmanytuples(size)
-                data = self.targetconnection.fetchmany(size)
-
-            for rawrow in data:
-                if cachefullrows:
-                    self.__key2row[rawrow[0]] = rawrow
-                t = tuple([rawrow[i] for i in positions])
-                self.__vals2key[t] = rawrow[0]
-
-    def lookup(self, row, namemapping={}):
-        if self.__prefill and self.cacheoninsert and \
-                (self.__size <= 0 or len(self.__vals2key) < self.__size):
-            # Everything is cached. We don't have to look in the DB
-            res = self._before_lookup(row, namemapping)
-            if res is not None:
-                return res
-            else:
-                return self.defaultidvalue
-        else:
-            # Something is not cached so we have to use the classical lookup
-            return Dimension.lookup(self, row, namemapping)
-
-    def _before_lookup(self, row, namemapping):
-        namesinrow =[(namemapping.get(a) or a) for a in self.lookupatts]
-        searchtuple = tuple([row[n] for n in namesinrow])
-        return self.__vals2key.get(searchtuple, None)
-
-    def _after_lookup(self, row, namemapping, resultkey):
-        if resultkey is not None:
-            namesinrow =[(namemapping.get(a) or a) for a in self.lookupatts]
-            searchtuple = tuple([row[n] for n in namesinrow])
-            self.__vals2key[searchtuple] = resultkey
-
-    def _before_getbykey(self, keyvalue):
-        if self.cachefullrows:
-            res = self.__key2row.get(keyvalue)
-            if res is not None:
-                return dict(zip(self.all, res))
-        return None
-
-    def _after_getbykey(self, keyvalue, resultrow):
-        if self.cachefullrows and resultrow[self.key] is not None:
-            # if resultrow[self.key] is None, no result was found in the db
-            self.__key2row[keyvalue] = tuple([resultrow[a] for a in self.all])
-
-    def _before_update(self, row, namemapping):
-        """ """
-        # We have to remove old values from the caches.
-        key = (namemapping.get(self.key) or self.key)
-        for att in self.lookupatts:
-            if ((att in namemapping and namemapping[att] in row) or att in row):
-                # A lookup attribute is about to be changed and we should make
-                # sure that the cache does not map from the old value.  Here,
-                # we can only see the new value, but we can get the old lookup
-                # values by means of the key:
-                oldrow = self.getbykey(row[key])
-                namesinrow =[(namemapping.get(a) or a) for a in self.lookupatts]
-                searchtuple = tuple([oldrow[n] for n in namesinrow])
-                if searchtuple in self.__vals2key:
-                    del self.__vals2key[searchtuple]
-                break
-
-
-        if self.cachefullrows:
-            if row[key] in self.__key2row:
-                # The cached row is now incorrect. We must make sure it is
-                # not in the cache.
-                del self.__key2row[row[key]]
-
-        return None
-
-    def _after_insert(self, row, namemapping, newkeyvalue):
-        """ """
-        # After the insert, we can look the row up. Pretend that we
-        # did that. Then we get the new data cached.
-        # NB: Here we assume that the DB doesn't change or add anything.
-        # For example, a DEFAULT value in the DB breaks this assumption.
-        if self.cacheoninsert:
-            self._after_lookup(row, namemapping, newkeyvalue)
-            if self.cachefullrows:
-                tmp = pygrametl.project(self.all, row, namemapping)
-                tmp[self.key] = newkeyvalue
-                self._after_getbykey(newkeyvalue, tmp)
-
-
-
-
-
 
 
 
