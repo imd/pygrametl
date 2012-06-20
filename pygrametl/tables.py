@@ -1373,9 +1373,9 @@ class FactTable(object):
            - keyvalues: a dict at least containing values for all keys
            - namemapping: an optional namemapping (see module's documentation)
         """
-        res = self._before_lookup(sefl, keyvalues, namemapping)
+        res = self._before_lookup(self, keyvalues, namemapping)
         if res:
-            returnself._emptyfacttonone(res)
+            return self._emptyfacttonone(res)
         self.targetconnection.execute(self.lookupsql, keyvalues, namemapping)
         res = self.targetconnection.fetchone(self.all)
         usedkeys = [key for key in self.keyrefs if res[key] is not None] #has values for keyrefs?
